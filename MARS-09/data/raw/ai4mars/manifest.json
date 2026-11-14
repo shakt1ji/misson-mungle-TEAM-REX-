@@ -1,0 +1,29 @@
+{
+  "dataset": "hassanjbara/AI4MARS",
+  "train": {
+    "split": "train",
+    "seen_rows": 64,
+    "saved_labelled_pairs": 50,
+    "skipped_unlabelled": 14,
+    "skipped_corrupt": 0,
+    "source_image_modes": {
+      "L": 50
+    },
+    "source_mask_modes": {
+      "L": 50
+    }
+  },
+  "test_min3": {
+    "split": "test_min3",
+    "seen_rows": 50,
+    "saved_labelled_pairs": 50,
+    "skipped_unlabelled": 0,
+    "skipped_corrupt": 0,
+    "source_image_modes": {
+      "L": 50
+    },
+    "source_mask_modes": {
+      "L": 50
+    }
+  }
+}

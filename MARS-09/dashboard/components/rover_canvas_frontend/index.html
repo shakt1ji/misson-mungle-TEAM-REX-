@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; user-select: none; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #0d0c0b;
+      color: #f3ede4;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+    }
+    .wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+    }
+    .canvas-frame {
+      position: relative;
+      border: 1px solid #352b25;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #1a120e;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+    }
+    canvas {
+      display: block;
+      cursor: grab;
+    }
+    canvas.mode-add, canvas.mode-paint, canvas.mode-start, canvas.mode-goal { cursor: crosshair; }
+    canvas.mode-remove { cursor: not-allowed; }
+    canvas.dragging { cursor: grabbing; }
+    .hud-bar {
+      width: 100%;
+      max-width: 620px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 4px 0;
+      font-size: 12px;
+      color: #b7a99a;
+      font-variant-numeric: tabular-nums;
+    }
+    .legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 11px;
+    }
+    .dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 2px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="canvas-frame">
+      <canvas id="marsCanvas" width="600" height="600"></canvas>
+    </div>
+    <div class="hud-bar">
+      <span id="hoverInfo">Hover grid cell to inspect terrain &amp; slope</span>
+      <div class="legend">
+        <span><i class="dot" style="background:#00e5ff"></i>Active Route</span>
+        <span><i class="dot" style="background:#38bdf8"></i>Travelled</span>
+        <span><i class="dot" style="background:#94a3b8"></i>Previous</span>
+        <span><i class="dot" style="background:#e05638"></i>Rock</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("marsCanvas");
+    const ctx = canvas.getContext("2d");
+    const hoverInfo = document.getElementById("hoverInfo");
+
+    let currentState = null;
+    let interactionMode = "drag";
+    let brushType = "sand";
+    let radiusCells = 0;
+
+    let draggingObstacleId = null;
+    let dragPreviewCell = null;
+    let isPainting = false;
+    let lastPaintedKey = "";
+    let hoverCell = null;
+    let eventCounter = 0;
+
+    const TERRAIN_COLORS = {
+      0: [164, 114, 74],   // soil
+      1: [110, 108, 112],  // bedrock
+      2: [212, 166, 98],   // sand
+      3: [152, 66, 48],    // big_rock
+      255: [42, 42, 46],   // unknown
+    };
+    const TERRAIN_NAMES = {
+      0: "Soil",
+      1: "Bedrock",
+      2: "Loose Sand",
+      3: "Big Rock",
+      255: "Unknown",
+    };
+
+    function sendMessage(type, payload) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...payload }, "*");
+    }
+
+    function emitAction(actionObj) {
+      eventCounter += 1;
+      const value = {
+        ...actionObj,
+        event_id: `ev_${Date.now()}_${eventCounter}`,
+      };
+      sendMessage("streamlit:setComponentValue", { value });
+    }
+
+    function canvasToGrid(clientX, clientY) {
+      if (!currentState) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      const [rows, cols] = currentState.grid_shape;
+      const col = Math.max(0, Math.min(cols - 1, Math.floor((x / rect.width) * cols)));
+      const row = Math.max(0, Math.min(rows - 1, Math.floor((y / rect.height) * rows)));
+      return [row, col];
+    }
+
+    function findObstacleAt(row, col) {
+      if (!currentState) return null;
+      for (const obs of currentState.obstacles) {
+        if (obs.row === row && obs.col === col) return obs;
+      }
+      for (const obs of currentState.obstacles) {
+        for (const [fr, fc] of obs.footprint || []) {
+          if (fr === row && fc === col) return obs;
+        }
+      }
+      return null;
+    }
+
+    function drawScene() {
+      if (!currentState || !currentState.grids) return;
+      const [rows, cols] = currentState.grid_shape;
+      const cw = canvas.width / cols;
+      const ch = canvas.height / rows;
+      const elev = currentState.grids.elevation;
+      const slope = currentState.grids.slope_deg;
+      const tclass = currentState.grids.terrain_class_ids;
+      const cost = currentState.grids.total_cost;
+      const unc = currentState.grids.uncertainty;
+      const blocked = currentState.grids.blocked_mask;
+
+      // Elevation range for relief shading
+      let zMin = Infinity, zMax = -Infinity;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const z = elev[r][c];
+          if (z < zMin) zMin = z;
+          if (z > zMax) zMax = z;
+        }
+      }
+      const zSpan = Math.max(zMax - zMin, 1e-3);
+
+      // 1. Base Martian terrain + elevation relief shading
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const cid = tclass[r][c];
+          const base = TERRAIN_COLORS[cid] || TERRAIN_COLORS[255];
+          const normZ = (elev[r][c] - zMin) / zSpan;
+          const shade = 0.72 + 0.42 * normZ;
+          let rr = Math.min(255, Math.round(base[0] * shade));
+          let gg = Math.min(255, Math.round(base[1] * shade));
+          let bb = Math.min(255, Math.round(base[2] * shade));
+
+          if (currentState.show_cost_overlay) {
+            const cv = cost[r][c];
+            if (cv < 0) {
+              rr = 140; gg = 30; bb = 30;
+            } else {
+              const t = Math.min(1, cv / 12.0);
+              rr = Math.round(rr * 0.45 + 245 * t * 0.55);
+              gg = Math.round(gg * 0.45 + 165 * (1 - t) * 0.55);
+              bb = Math.round(bb * 0.45 + 35 * (1 - t) * 0.55);
+            }
+          }
+
+          if (currentState.show_uncertainty_overlay) {
+            const uv = unc[r][c];
+            rr = Math.round(rr * (1 - 0.55 * uv) + 192 * 0.55 * uv);
+            gg = Math.round(gg * (1 - 0.55 * uv) + 72 * 0.55 * uv);
+            bb = Math.round(bb * (1 - 0.55 * uv) + 235 * 0.55 * uv);
+          }
+
+          ctx.fillStyle = `rgb(${rr},${gg},${bb})`;
+          ctx.fillRect(c * cw, r * ch, cw + 0.6, ch + 0.6);
+
+          // Static/non-rock blocked hatch
+          if (blocked[r][c] === 1) {
+            ctx.fillStyle = "rgba(180, 42, 32, 0.25)";
+            ctx.fillRect(c * cw, r * ch, cw, ch);
+          }
+
+          // Subtle topographic grid lines
+          ctx.strokeStyle = "rgba(255, 225, 195, 0.06)";
+          ctx.lineWidth = 0.6;
+          ctx.strokeRect(c * cw, r * ch, cw, ch);
+        }
+      }
+
+      // 2. Previous route (dashed)
+      if (currentState.show_previous_route && currentState.routes.previous_route.length >= 2) {
+        ctx.save();
+        ctx.strokeStyle = "rgba(180, 196, 214, 0.72)";
+        ctx.lineWidth = 2.0;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        currentState.routes.previous_route.forEach(([r, c], i) => {
+          const x = (c + 0.5) * cw;
+          const y = (r + 0.5) * ch;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 3. Travelled dual wheel tracks (matching reference image!)
+      const pts = currentState.routes.travelled_points || [];
+      if (pts.length >= 2) {
+        for (const offset of [-0.18, 0.18]) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(38, 128, 255, 0.85)";
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            const [r, c] = pts[i];
+            const prev = pts[Math.max(0, i - 1)];
+            const next = pts[Math.min(pts.length - 1, i + 1)];
+            const ang = Math.atan2(next[0] - prev[0], next[1] - prev[1]);
+            const rx = (c + 0.5 - Math.sin(ang) * offset) * cw;
+            const ry = (r + 0.5 + Math.cos(ang) * offset) * ch;
+            if (i === 0) ctx.moveTo(rx, ry);
+            else ctx.lineTo(rx, ry);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      // 4. Active planned UARA* route (glowing dual cyan/blue track)
+      const active = currentState.routes.active_route || [];
+      if (active.length >= 2) {
+        ctx.save();
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.35)";
+        ctx.lineWidth = 6.5;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        active.forEach(([r, c], i) => {
+          const x = (c + 0.5) * cw;
+          const y = (r + 0.5) * ch;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        ctx.strokeStyle = "#00e5ff";
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        active.forEach(([r, c], i) => {
+          const x = (c + 0.5) * cw;
+          const y = (r + 0.5) * ch;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 5. Start & Goal beacons
+      const [sr, sc] = currentState.start_cell;
+      const [gr, gc] = currentState.goal_cell;
+      ctx.fillStyle = "#22c55e";
+      ctx.beginPath();
+      ctx.arc((sc + 0.5) * cw, (sr + 0.5) * ch, cw * 0.32, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#08120c";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Goal target diamond
+      const gx = (gc + 0.5) * cw;
+      const gy = (gr + 0.5) * ch;
+      ctx.fillStyle = "#f59e0b";
+      ctx.beginPath();
+      ctx.moveTo(gx, gy - ch * 0.45);
+      ctx.lineTo(gx + cw * 0.45, gy);
+      ctx.lineTo(gx, gy + ch * 0.45);
+      ctx.lineTo(gx - cw * 0.45, gy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#1c1204";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // 6. Draggable 3D-shaded boulders
+      for (const obs of currentState.obstacles) {
+        const isBeingDragged = draggingObstacleId === obs.obstacle_id;
+        const drawR = isBeingDragged && dragPreviewCell ? dragPreviewCell[0] : obs.row;
+        const drawC = isBeingDragged && dragPreviewCell ? dragPreviewCell[1] : obs.col;
+
+        // Footprint highlight
+        ctx.fillStyle = isBeingDragged ? "rgba(255, 196, 60, 0.32)" : "rgba(220, 68, 46, 0.22)";
+        if (isBeingDragged && dragPreviewCell) {
+          const rad = obs.radius_cells || 0;
+          for (let dr = -rad; dr <= rad; dr++) {
+            for (let dc = -rad; dc <= rad; dc++) {
+              if (Math.hypot(dr, dc) <= rad + 0.15) {
+                ctx.fillRect((drawC + dc) * cw, (drawR + dr) * ch, cw, ch);
+              }
+            }
+          }
+        } else {
+          for (const [fr, fc] of obs.footprint || []) {
+            ctx.fillRect(fc * cw, fr * ch, cw, ch);
+          }
+        }
+
+        const cx = (drawC + 0.5) * cw;
+        const cy = (drawR + 0.5) * ch;
+        const radPx = (0.44 + (obs.radius_cells || 0) * 0.62) * Math.min(cw, ch);
+
+        // Rock drop shadow
+        ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+        ctx.beginPath();
+        ctx.ellipse(cx + 2, cy + 3, radPx * 1.04, radPx * 0.82, 0.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Faceted rock polygon
+        const grad = ctx.createRadialGradient(cx - radPx * 0.3, cy - radPx * 0.3, 1, cx, cy, radPx);
+        grad.addColorStop(0, isBeingDragged ? "#f9a852" : "#b86344");
+        grad.addColorStop(1, isBeingDragged ? "#993d1c" : "#51261a");
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        const sides = 7;
+        for (let k = 0; k < sides; k++) {
+          const a = (k / sides) * Math.PI * 2 + 0.3;
+          const jitter = 0.82 + 0.22 * ((k * 37) % 5) / 4;
+          const px = cx + Math.cos(a) * radPx * jitter;
+          const py = cy + Math.sin(a) * radPx * jitter;
+          if (k === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = isBeingDragged ? "#fde047" : "#f87171";
+        ctx.lineWidth = isBeingDragged ? 2.0 : 1.1;
+        ctx.stroke();
+      }
+
+      // 7. Hover reticle
+      if (hoverCell) {
+        const [hr, hc] = hoverCell;
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
+        ctx.lineWidth = 1.2;
+        ctx.strokeRect(hc * cw + 0.5, hr * ch + 0.5, cw - 1, ch - 1);
+      }
+
+      // 8. 6-wheel Mars Rover icon
+      const rx = (currentState.rover.col_f + 0.5) * cw;
+      const ry = (currentState.rover.row_f + 0.5) * ch;
+      const ang = currentState.rover.heading_rad || 0;
+      ctx.save();
+      ctx.translate(rx, ry);
+      ctx.rotate(ang);
+
+      // 6 wheels
+      ctx.fillStyle = "#18181b";
+      for (const wx of [-0.36 * cw, 0, 0.36 * cw]) {
+        for (const wy of [-0.36 * ch, 0.36 * ch]) {
+          ctx.fillRect(wx - 2.4, wy - 1.8, 4.8, 3.6);
+        }
+      }
+      // Chassis body
+      ctx.fillStyle = "#e5e7eb";
+      ctx.strokeStyle = "#0ea5e9";
+      ctx.lineWidth = 1.4;
+      ctx.fillRect(-0.34 * cw, -0.24 * ch, 0.68 * cw, 0.48 * ch);
+      ctx.strokeRect(-0.34 * cw, -0.24 * ch, 0.68 * cw, 0.48 * ch);
+      // Mastcam head pointing forward (+x)
+      ctx.fillStyle = "#38bdf8";
+      ctx.fillRect(0.14 * cw, -0.1 * ch, 0.2 * cw, 0.2 * ch);
+      ctx.restore();
+    }
+
+    canvas.addEventListener("mousedown", (e) => {
+      const cell = canvasToGrid(e.clientX, e.clientY);
+      if (!cell || !currentState) return;
+      const [row, col] = cell;
+
+      if (interactionMode === "drag") {
+        const obs = findObstacleAt(row, col);
+        if (obs && obs.is_draggable) {
+          draggingObstacleId = obs.obstacle_id;
+          dragPreviewCell = [row, col];
+          canvas.classList.add("dragging");
+          drawScene();
+        }
+      } else if (interactionMode === "add") {
+        emitAction({ action: "add_obstacle", row, col, radius_cells: radiusCells });
+      } else if (interactionMode === "remove") {
+        const obs = findObstacleAt(row, col);
+        if (obs) {
+          emitAction({ action: "remove_obstacle", obstacle_id: obs.obstacle_id, row, col });
+        }
+      } else if (interactionMode === "paint") {
+        isPainting = true;
+        lastPaintedKey = `${row},${col}`;
+        emitAction({ action: "paint_terrain", cells: [[row, col]], terrain_type: brushType });
+      } else if (interactionMode === "start") {
+        emitAction({ action: "set_start", row, col });
+      } else if (interactionMode === "goal") {
+        emitAction({ action: "set_goal", row, col });
+      }
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      const cell = canvasToGrid(e.clientX, e.clientY);
+      if (!cell || !currentState || !currentState.grids) return;
+      hoverCell = cell;
+      const [r, c] = cell;
+      const z = currentState.grids.elevation[r][c];
+      const sl = currentState.grids.slope_deg[r][c];
+      const cs = currentState.grids.total_cost[r][c];
+      const tc = TERRAIN_NAMES[currentState.grids.terrain_class_ids[r][c]] || "Unknown";
+      hoverInfo.textContent = `Cell (${r}, ${c}) | ${tc} | Elev ${z.toFixed(1)}m | Slope ${sl.toFixed(1)}° | Cost ${cs < 0 ? "INF" : cs.toFixed(2)}`;
+
+      if (draggingObstacleId) {
+        dragPreviewCell = [r, c];
+        drawScene();
+      } else if (isPainting && interactionMode === "paint") {
+        const key = `${r},${c}`;
+        if (key !== lastPaintedKey) {
+          lastPaintedKey = key;
+          emitAction({ action: "paint_terrain", cells: [[r, c]], terrain_type: brushType });
+        }
+      } else {
+        drawScene();
+      }
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (draggingObstacleId && dragPreviewCell) {
+        emitAction({
+          action: "move_obstacle",
+          obstacle_id: draggingObstacleId,
+          row: dragPreviewCell[0],
+          col: dragPreviewCell[1],
+        });
+      }
+      draggingObstacleId = null;
+      dragPreviewCell = null;
+      isPainting = false;
+      canvas.classList.remove("dragging");
+      drawScene();
+    });
+
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") return;
+      const args = event.data.args || {};
+      currentState = args.sim_state || null;
+      interactionMode = args.interaction_mode || "drag";
+      brushType = args.terrain_brush || "sand";
+      radiusCells = Number(args.rock_radius_cells || 0);
+
+      canvas.className = `mode-${interactionMode}`;
+      drawScene();
+      sendMessage("streamlit:setFrameHeight", { height: 636 });
+    });
+
+    sendMessage("streamlit:componentReady", { apiVersion: 1 });
+    sendMessage("streamlit:setFrameHeight", { height: 636 });
+  </script>
+</body>
+</html>

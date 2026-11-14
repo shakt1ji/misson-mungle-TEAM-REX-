@@ -1,0 +1,13 @@
+# MARS-09 Member 2 ML & Computer Vision Dependencies
+# Note: Install PyTorch first using the official command for your Windows CPU or CUDA
+# environment (https://pytorch.org/get-started/locally/), for example:
+#   CPU only: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.1.0
+torchvision>=0.16.0
+datasets>=2.18.0
+huggingface-hub>=0.21.0
+pyarrow>=14.0.0
+Pillow>=10.0.0
+tqdm>=4.66.0

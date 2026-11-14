@@ -1,0 +1,6 @@
+{
+  "name": "MARS-09",
+  "description": "MARS-09 Mars rover terrain intelligence and uncertainty-aware autonomous navigation modules (Member 1).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
